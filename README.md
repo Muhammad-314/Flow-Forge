@@ -6,7 +6,7 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.2 — Visual Workflow Builder**
+**V0.3 — Workflow Validation**
 
 V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system.
 
@@ -92,6 +92,85 @@ PUT /api/workflows/{workflowId}/definition
 ```
 
 See [`docs/api/workflow-definition.md`](docs/api/workflow-definition.md).
+
+## V0.3 — Workflow Validation
+
+### Goal
+
+V0.3 answers:
+
+> Can FlowForge reject structurally invalid workflow definitions before they replace a persisted valid graph?
+
+The answer is yes.
+
+Validation is implemented as a separate, reusable backend concern. The workflow-definition service validates the submitted graph before deleting or replacing the existing persisted graph.
+
+### Implemented and verified
+
+- Dedicated `WorkflowDefinitionValidator`
+- Dedicated `ValidationResult` and `ValidationError` response models
+- Dedicated `WorkflowDefinitionValidationException`
+- Exactly one Start node required
+- Supported node types restricted to:
+  - `start`
+  - `httpRequest`
+  - `transform`
+- Duplicate node-ID detection
+- Edge source/target existence validation
+- Self-loop rejection
+- Duplicate edge rejection
+- HTTP Request configuration validation:
+  - method required
+  - method restricted to `GET`, `POST`, `PUT`, `DELETE`
+  - URL required
+  - URL must be a valid `http`/`https` URI with a host
+- Transform expression validation
+- Start-node configuration validation
+- Disconnected-node detection through reachability from Start
+- Multiple validation errors collected in one response
+- Validation occurs before destructive persistence
+- Invalid saves return HTTP 400 with structured validation details
+- Existing valid definitions remain intact after rejected saves
+- Validator unit-test coverage
+- Workflow-definition controller integration-test coverage
+- Full backend test suite passes
+- Manual API verification completed
+
+### Validation response
+
+An invalid definition returns:
+
+```json
+{
+  "valid": false,
+  "errors": [
+    {
+      "nodeId": null,
+      "message": "Workflow must contain a Start node."
+    }
+  ]
+}
+```
+
+`nodeId` is `null` when an error applies to the workflow as a whole rather than to one specific node.
+
+### Validation boundary
+
+V0.3 validates workflow definitions but does not execute them.
+
+It deliberately does not include:
+
+- synchronous execution
+- execution persistence
+- asynchronous workers
+- RabbitMQ
+- retries
+- idempotency
+- scheduling
+- branching
+- variables or expression evaluation
+
+Those capabilities remain later-version concerns.
 
 ## Architecture
 
@@ -238,17 +317,31 @@ http://localhost:5173
 
 ### Backend
 
-The latest backend verification completed successfully:
+V0.3 backend verification completed successfully with:
+
+```powershell
+.\mvnw.cmd -q test
+```
+
+The full backend suite passed with:
 
 ```text
-Tests run: 33
 Failures: 0
 Errors: 0
-Skipped: 0
 BUILD SUCCESS
 ```
 
-The suite includes the existing User/Workflow integration coverage plus workflow-definition integration coverage for:
+Additional V0.3-focused verification includes:
+
+- dedicated `WorkflowDefinitionValidator` unit tests
+- workflow-definition controller integration tests
+- valid workflow-definition save
+- persisted definition retrieval
+- invalid definition rejection with HTTP 400
+- structured validation-error response
+- preservation of the previously valid definition after an invalid save
+
+The V0.2 workflow-definition coverage remains in the suite for:
 
 - definition retrieval
 - graph save/load
@@ -286,12 +379,36 @@ The visual editor has been manually exercised for:
 - selecting and deleting individual edges
 - persistence of edge deletion
 
+### Manual V0.3 verification
+
+The workflow-definition API was manually verified against the running backend:
+
+1. A valid `start → httpRequest` graph was saved successfully.
+2. A subsequent GET returned the persisted graph.
+3. An invalid graph containing no Start node returned HTTP 400.
+4. The response contained:
+   ```json
+   {
+     "valid": false,
+     "errors": [
+       {
+         "nodeId": null,
+         "message": "Workflow must contain a Start node."
+       }
+     ]
+   }
+   ```
+5. A subsequent GET confirmed that the original valid graph remained persisted after the rejected save.
+
+This verifies the validation-before-persistence safety boundary.
+
 ## Documentation
 
 ### Architecture
 
 - [`docs/architecture/v0.1-architecture.md`](docs/architecture/v0.1-architecture.md)
 - [`docs/architecture/v0.2-architecture.md`](docs/architecture/v0.2-architecture.md)
+- [`docs/architecture/v0.3-architecture.md`](docs/architecture/v0.3-architecture.md)
 
 ### API
 
@@ -308,15 +425,16 @@ The visual editor has been manually exercised for:
 ### Diagrams
 
 - [`docs/diagrams/workflow-definition-v0.2.md`](docs/diagrams/workflow-definition-v0.2.md)
+- [`docs/diagrams/workflow-definition-v0.3-validation.md`](docs/diagrams/workflow-definition-v0.3-validation.md)
 
 ## Architecture Evolution
 
 ```text
 V0.1  Foundation
   ↓
-V0.2  Visual Workflow Builder       ← current
+V0.2  Visual Workflow Builder
   ↓
-V0.3  Workflow Validation
+V0.3  Workflow Validation             ← current
   ↓
 V0.4  Synchronous Execution Engine
   ↓
@@ -340,15 +458,8 @@ The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worke
 
 ## Next Version
 
-**V0.3 — Workflow Validation**
+**V0.4 — Synchronous Execution Engine**
 
-Planned validation includes:
+V0.4 will introduce the first workflow execution path. It will execute an already-validated workflow definition synchronously within the backend request lifecycle.
 
-- workflow must contain a trigger/start node
-- no disconnected nodes
-- no invalid edges
-- required node configuration
-- duplicate node-ID detection
-- valid node types
-
-Validation will be introduced before execution so that V0.4 can operate on a graph whose structural validity has already been established.
+The execution engine will build on the validated graph established in V0.3 rather than re-implementing structural validation.
