@@ -6,7 +6,7 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.5 — Execution Persistence**
+**V0.6 — Asynchronous Execution**
 
 V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system.
 
@@ -423,7 +423,7 @@ The definition endpoint persists the current visual graph, including node IDs, t
 POST /api/workflows/{workflowId}/execute
 ```
 
-The endpoint executes the workflow's current persisted definition synchronously and returns the persisted execution ID.
+The endpoint creates a persisted execution and queues it for asynchronous processing. It returns the execution ID immediately with HTTP `202 Accepted`.
 
 Optional trigger data can be supplied:
 
@@ -437,9 +437,9 @@ Optional trigger data can be supplied:
 
 The request body may also be omitted; trigger data defaults to an empty map.
 
-The response contains an `executionId`, execution success, node outputs, and an error message when execution fails.
+The response contains an `executionId` and its current status. Node outputs and terminal execution state are available through the execution-detail API.
 
-Execution failures use `success: false` with an empty `outputs` object. The execution is still persisted and can be queried through the execution history/detail APIs.
+Execution completion is persisted independently of the initial request. Clients can query the execution detail endpoint after the `202 Accepted` response.
 
 Unknown workflow IDs remain HTTP 404 resource-not-found responses.
 
@@ -828,3 +828,225 @@ The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worke
 **V0.6 — Asynchronous Execution**
 
 V0.6 will address the request-lifecycle limitation of synchronous execution by introducing asynchronous execution and RabbitMQ. Workers remain a separate concern for V0.7.
+
+
+## V0.6 — Asynchronous Execution
+
+### Goal
+
+V0.6 answers:
+
+> Can FlowForge decouple API requests from workflow execution by durably recording an execution in PostgreSQL and dispatching execution work through RabbitMQ?
+
+The answer is yes.
+
+### Implemented and verified
+
+- RabbitMQ added as the asynchronous execution transport
+- Durable RabbitMQ exchange, queue, and routing key for execution jobs
+- JSON message conversion through Spring AMQP/Jackson
+- `ExecutionJob` message containing the persisted execution ID
+- Execution records now enter `QUEUED` before asynchronous processing
+- `POST /api/workflows/{workflowId}/execute` returns HTTP `202 Accepted`
+- API response reduced to the stable execution identifier and current status
+- Exact workflow-version lookup during worker processing
+- Dedicated `ExecutionWorkerService` execution boundary
+- RabbitMQ listener/consumer for queued execution jobs
+- Worker loads the execution and exact persisted workflow version from PostgreSQL
+- Worker reuses the existing workflow execution engine rather than creating a second execution engine
+- Existing execution/node lifecycle persistence continues to record the asynchronous run
+- Controller integration coverage verifies `202 QUEUED`, eventual success, and the full seven-event lifecycle
+- Consumer and worker unit-test coverage
+- Full backend test suite verification after the V0.6 lifecycle correction
+
+### Asynchronous execution flow
+
+```text
+Client
+  |
+  | POST /api/workflows/{workflowId}/execute
+  v
+Spring Boot API
+  |
+  | create execution in PostgreSQL
+  | status = QUEUED
+  v
+PostgreSQL
+  |
+  | publish ExecutionJob(executionId)
+  v
+RabbitMQ
+  |
+  | execution.created
+  v
+ExecutionJobConsumer
+  |
+  v
+ExecutionWorkerService
+  |
+  +--> load Execution by executionId
+  |
+  +--> load exact WorkflowVersion
+  |
+  +--> load exact WorkflowDefinition snapshot
+  |
+  +--> mark execution RUNNING
+  |
+  v
+WorkflowExecutionEngine
+  |
+  +--> Start
+  +--> Transform / HTTP Request
+  +--> lifecycle persistence
+  |
+  v
+PostgreSQL
+  |
+  +--> EXECUTION_COMPLETED / EXECUTION_FAILED
+  +--> node records
+  +--> execution events
+```
+
+The API does not execute workflow nodes before returning. It creates the execution record, transitions it to `QUEUED`, publishes a small RabbitMQ job containing the execution ID, and returns the execution identifier with HTTP `202`.
+
+The worker is intentionally thin. PostgreSQL remains the source of truth for execution state and workflow definitions; RabbitMQ only transports the work signal.
+
+### V0.6 execution lifecycle
+
+```text
+API request
+    |
+    v
+QUEUED
+    |
+    | RabbitMQ dispatch
+    v
+RUNNING
+    |
+    +--> NODE_STARTED
+    |        |
+    |        v
+    |   node executor
+    |        |
+    |   +----+----+
+    |   |         |
+    | success   failure
+    |   |         |
+    |   v         v
+    | NODE_      NODE_FAILED
+    | COMPLETED      |
+    |   |            |
+    +---+------------+
+        |
+        +--> EXECUTION_COMPLETED -> SUCCESS
+        |
+        +--> EXECUTION_FAILED    -> FAILED
+```
+
+For a successful two-node workflow, the expected persisted event order is:
+
+```text
+EXECUTION_QUEUED
+EXECUTION_STARTED
+NODE_STARTED
+NODE_COMPLETED
+NODE_STARTED
+NODE_COMPLETED
+EXECUTION_COMPLETED
+```
+
+The terminal execution event is written by the engine's lifecycle listener. The worker does not duplicate the terminal persistence call.
+
+### Execution API in V0.6
+
+```text
+POST /api/workflows/{workflowId}/execute
+GET  /api/workflows/{workflowId}/executions
+GET  /api/executions/{executionId}
+```
+
+Example request:
+
+```json
+{
+  "triggerData": {
+    "message": "hello"
+  }
+}
+```
+
+The execution request returns immediately with a response shaped like:
+
+```json
+{
+  "executionId": "<uuid>",
+  "status": "QUEUED"
+}
+```
+
+The client can use the returned execution ID with the execution-detail endpoint to observe the persisted state.
+
+### Why the queue message contains only an execution ID
+
+The message intentionally does not contain a full workflow definition or mutable execution payload. The execution ID is the durable correlation key. The worker reloads the execution and exact workflow-version data from PostgreSQL before running the workflow.
+
+This keeps PostgreSQL as the source of truth and prevents the RabbitMQ message from becoming a second authoritative copy of workflow state.
+
+### V0.6 boundary
+
+V0.6 adds asynchronous dispatch, not a complete distributed execution platform.
+
+It deliberately does not include:
+
+- worker pools or horizontal worker scaling
+- retries or dead-letter queues
+- idempotency / deduplication guarantees
+- scheduling
+- delayed execution
+- WebSockets or push status updates
+- transactional outbox
+- exactly-once delivery semantics
+- branching or parallel workflow execution
+- distributed locking
+
+A database commit and RabbitMQ publish are separate operations in V0.6. A process failure between those operations can therefore leave a persisted `QUEUED` execution without a published job. Reliability mechanisms such as an outbox belong to a later version.
+
+### Local RabbitMQ infrastructure
+
+Docker Compose now includes RabbitMQ with the management UI:
+
+```text
+AMQP:       localhost:5672
+Management: http://localhost:15672
+Username:   guest
+Password:   guest
+```
+
+The backend connects to RabbitMQ using the Spring Boot AMQP configuration in `application.yml`.
+
+### Architecture after V0.6
+
+```text
+React + TypeScript + Vite
+          |
+          | HTTP / REST
+          v
+     Spring Boot API
+          |
+     +----+-------------------+
+     |                        |
+     v                        v
+PostgreSQL                RabbitMQ
+(source of truth)         (async transport)
+                              |
+                              v
+                        Execution Worker
+                              |
+                              v
+                    WorkflowExecutionEngine
+                              |
+                              v
+                         PostgreSQL
+```
+
+FlowForge remains a modular monolith. The worker is a logical execution boundary inside the Spring Boot application; V0.6 does not introduce an independent microservice.
