@@ -6,7 +6,7 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.3 — Workflow Validation**
+**V0.4 — Synchronous Execution Engine**
 
 V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system.
 
@@ -172,6 +172,98 @@ It deliberately does not include:
 
 Those capabilities remain later-version concerns.
 
+## V0.4 — Synchronous Execution Engine
+
+### Goal
+
+V0.4 answers:
+
+> Can FlowForge execute an already-validated workflow definition synchronously within the backend?
+
+The answer is yes.
+
+V0.4 introduces the first workflow execution path. The execution engine consumes the validated `WorkflowDefinition` produced by the workflow-definition layer and executes nodes in graph order during the API request.
+
+### Implemented and verified
+
+- `ExecutionContext` for trigger data, variables, node outputs, and metadata
+- `NodeExecutionContext` for node-level execution
+- `NodeExecutionResult` for explicit success/failure results
+- Pluggable `WorkflowNodeExecutor` interface
+- `WorkflowNodeExecutorRegistry`
+- Start-node executor
+- Transform executor
+- HTTP Request executor
+- Synchronous `WorkflowExecutionEngine`
+- `WorkflowExecutionService` application layer
+- Workflow execution REST endpoint
+- Successful execution response mapping
+- Runtime cycle detection
+- Multiple-outgoing-edge rejection in V0.4
+- Missing-executor handling
+- Node execution failure handling
+- Actual local HTTP execution tests
+- Workflow execution controller integration tests
+- Full backend test suite verification: **86 tests, 0 failures, 0 errors**
+
+### Execution model
+
+```text
+POST /api/workflows/{workflowId}/execute
+              ↓
+WorkflowExecutionService
+              ↓
+WorkflowDefinitionService
+              ↓
+Validated WorkflowDefinition
+              ↓
+WorkflowExecutionEngine
+              ↓
+WorkflowNodeExecutorRegistry
+       ┌──────┼──────────┐
+       ↓      ↓          ↓
+     Start Transform  HTTP Request
+       └──────┼──────────┘
+              ↓
+       ExecutionContext
+              ↓
+   ExecuteWorkflowResponse
+```
+
+The engine follows edges from the Start node. A node's successful output is stored in `ExecutionContext.nodeOutputs`.
+
+V0.4 supports a single linear execution path. If a node has more than one outgoing edge, execution fails explicitly because branching is a later concern.
+
+### Supported execution behavior
+
+`start` returns the workflow trigger data as its output.
+
+`transform` currently returns its configured expression string. V0.4 does **not** introduce an expression language or arbitrary code execution; expression evaluation remains a future concern.
+
+`httpRequest` performs synchronous HTTP requests using Java's built-in `HttpClient`. The current node configuration supports the methods and URL already defined by V0.3.
+
+HTTP responses below status 400 are successful node results. HTTP 400 and above are execution failures.
+
+### Important V0.4 boundary
+
+V0.4 intentionally does not include:
+
+- execution persistence
+- execution history
+- asynchronous execution
+- RabbitMQ
+- worker processes
+- retries
+- idempotency
+- scheduling
+- branching
+- durable execution state
+- expression evaluation
+- authentication or authorization for node requests
+- request headers or request bodies beyond the current V0.3 configuration
+
+The execution engine is intentionally synchronous and in-memory. V0.5 introduces persistence for executions and node-level execution state.
+
 ## Architecture
 
 ```text
@@ -185,7 +277,7 @@ React + TypeScript + Vite
       PostgreSQL
 ```
 
-The backend remains a **modular monolith**. V0.2 extends the workflow module with workflow-definition persistence rather than introducing a separate service.
+The backend remains a **modular monolith**. V0.4 adds execution as a separate logical backend package within the same Spring Boot application rather than introducing a separate worker service.
 
 The architecture will become more distributed only when a concrete scaling, reliability, or execution requirement justifies it.
 
@@ -232,6 +324,30 @@ PUT /api/workflows/{workflowId}/definition
 
 The definition endpoint persists the current visual graph, including node IDs, types, positions, configuration, and edge relationships.
 
+### Workflow Execution
+
+```text
+POST /api/workflows/{workflowId}/execute
+```
+
+The endpoint executes the workflow's current persisted definition synchronously.
+
+Optional trigger data can be supplied:
+
+```json
+{
+  "triggerData": {
+    "message": "hello"
+  }
+}
+```
+
+The request body may also be omitted; trigger data defaults to an empty map.
+
+The response contains execution success, node outputs, and an error message when execution fails.
+
+Execution failures use `success: false` with an empty `outputs` object. Unknown workflow IDs remain HTTP 404 resource-not-found responses.
+
 ### Health
 
 ```text
@@ -257,7 +373,7 @@ workflow_nodes
 workflow_edges
 ```
 
-The migrations are:
+V0.4 does not introduce a database migration. Execution state remains in memory until V0.5 introduces execution persistence.\n\nThe migrations are:
 
 ```text
 V1__create_users_and_workflows.sql
@@ -298,6 +414,36 @@ Backend:
 http://localhost:8080
 ```
 
+### V0.4 Execution Verification
+
+The V0.4 execution path was verified with:
+
+```powershell
+.\mvnw.cmd test
+```
+
+The complete backend suite passed:
+
+```text
+Tests run: 86
+Failures: 0
+Errors: 0
+Skipped: 0
+BUILD SUCCESS
+```
+
+Additional V0.4 coverage includes:
+
+- execution-engine unit tests
+- executor-registry tests
+- Start executor tests
+- Transform executor tests
+- HTTP executor tests against a controlled local HTTP server
+- execution-service tests
+- execution-response tests
+- workflow execution controller integration tests
+- persisted-definition execution through the REST endpoint
+
 ### Frontend
 
 From `frontend/`:
@@ -317,7 +463,7 @@ http://localhost:5173
 
 ### Backend
 
-V0.3 backend verification completed successfully with:
+V0.4 backend verification completed successfully with:
 
 ```powershell
 .\mvnw.cmd -q test
@@ -409,10 +555,12 @@ This verifies the validation-before-persistence safety boundary.
 - [`docs/architecture/v0.1-architecture.md`](docs/architecture/v0.1-architecture.md)
 - [`docs/architecture/v0.2-architecture.md`](docs/architecture/v0.2-architecture.md)
 - [`docs/architecture/v0.3-architecture.md`](docs/architecture/v0.3-architecture.md)
+- [`docs/architecture/v0.4-architecture.md`](docs/architecture/v0.4-architecture.md)
 
 ### API
 
 - [`docs/api/workflow-definition.md`](docs/api/workflow-definition.md)
+- [`docs/api/workflow-execution.md`](docs/api/workflow-execution.md)
 
 ### Architecture Decision Records
 
@@ -426,6 +574,7 @@ This verifies the validation-before-persistence safety boundary.
 
 - [`docs/diagrams/workflow-definition-v0.2.md`](docs/diagrams/workflow-definition-v0.2.md)
 - [`docs/diagrams/workflow-definition-v0.3-validation.md`](docs/diagrams/workflow-definition-v0.3-validation.md)
+- [`docs/diagrams/workflow-execution-v0.4.md`](docs/diagrams/workflow-execution-v0.4.md)
 
 ## Architecture Evolution
 
@@ -434,9 +583,9 @@ V0.1  Foundation
   ↓
 V0.2  Visual Workflow Builder
   ↓
-V0.3  Workflow Validation             ← current
+V0.3  Workflow Validation
   ↓
-V0.4  Synchronous Execution Engine
+V0.4  Synchronous Execution Engine   ← current
   ↓
 V0.5  Execution Persistence
   ↓
@@ -458,8 +607,8 @@ The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worke
 
 ## Next Version
 
-**V0.4 — Synchronous Execution Engine**
+**V0.5 — Execution Persistence**
 
-V0.4 will introduce the first workflow execution path. It will execute an already-validated workflow definition synchronously within the backend request lifecycle.
+V0.5 will persist workflow executions, node-level execution state, and execution outcomes so that execution history survives the request lifecycle and application restarts.
 
-The execution engine will build on the validated graph established in V0.3 rather than re-implementing structural validation.
+The V0.5 design will build on the synchronous execution engine established in V0.4 rather than replacing it with asynchronous infrastructure prematurely.
