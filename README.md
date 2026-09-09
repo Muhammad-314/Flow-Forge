@@ -6,7 +6,7 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.4 — Synchronous Execution Engine**
+**V0.5 — Execution Persistence**
 
 V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system.
 
@@ -204,7 +204,7 @@ V0.4 introduces the first workflow execution path. The execution engine consumes
 - Node execution failure handling
 - Actual local HTTP execution tests
 - Workflow execution controller integration tests
-- Full backend test suite verification: **86 tests, 0 failures, 0 errors**
+- Full backend test suite verification: **100 tests, 0 failures, 0 errors**
 
 ### Execution model
 
@@ -246,23 +246,116 @@ HTTP responses below status 400 are successful node results. HTTP 400 and above 
 
 ### Important V0.4 boundary
 
-V0.4 intentionally does not include:
+V0.4 intentionally did not include execution persistence, execution history, asynchronous execution, worker processes, retries, idempotency, scheduling, branching, durable execution state, or expression evaluation.
 
-- execution persistence
-- execution history
-- asynchronous execution
+V0.5 keeps the same synchronous execution engine and adds durable execution state and history around it.
+
+## V0.5 — Execution Persistence
+
+### Goal
+
+V0.5 answers:
+
+> Can FlowForge keep a durable record of workflow executions and their node-level outcomes while retaining the simple synchronous execution model?
+
+The answer is yes.
+
+### Implemented and verified
+
+- PostgreSQL-backed `executions` table
+- Workflow-version reference on every execution
+- Execution lifecycle status: `RUNNING`, `SUCCESS`, `FAILED`
+- Persisted trigger data
+- Execution start/completion timestamps
+- Persisted execution-level error message
+- PostgreSQL-backed `execution_nodes` table
+- Node lifecycle status: `RUNNING`, `SUCCESS`, `FAILED`
+- Persisted node outputs and node-level errors
+- PostgreSQL-backed `execution_events` table
+- Execution lifecycle events
+- Node start/completion/failure events
+- Execution history API
+- Execution detail API
+- Stable execution ID returned by the execution endpoint
+- Lifecycle listener boundary between the execution engine and persistence
+- Synchronous execution remains unchanged in its request/response model
+- Failure-path persistence integration coverage
+- Full backend test suite verification: **100 tests, 0 failures, 0 errors**
+
+### Persistence model
+
+```text
+WorkflowVersion
+      |
+      +---- Execution
+               |
+               +---- ExecutionNode
+               |
+               +---- ExecutionEvent
+```
+
+An execution stores the exact workflow-version ID used by the execution service. Node records and events reference execution IDs and node UUIDs.
+
+### Execution lifecycle
+
+```text
+create execution
+      |
+      v
+RUNNING
+      |
+      +--> NODE_STARTED
+      |        |
+      |        v
+      |   node execution
+      |        |
+      |   +----+----+
+      |   |         |
+      | success   failure
+      |   |         |
+      |   v         v
+      | NODE_     NODE_
+      | COMPLETED FAILED
+      |   |
+      +---+
+          |
+          v
+ EXECUTION_COMPLETED
+          |
+          v
+       SUCCESS
+```
+
+A workflow failure records the failed execution and node state before the request returns.
+
+### Execution history API
+
+```text
+GET /api/workflows/{workflowId}/executions
+GET /api/executions/{executionId}
+```
+
+The workflow-scoped endpoint returns executions ordered newest first.
+
+The detail endpoint returns the execution lifecycle state, trigger data, node execution records, and ordered execution events.
+
+### Important V0.5 boundary
+
+V0.5 remains synchronous.
+
+It deliberately does not add:
+
 - RabbitMQ
+- asynchronous execution
 - worker processes
 - retries
 - idempotency
 - scheduling
-- branching
-- durable execution state
-- expression evaluation
-- authentication or authorization for node requests
-- request headers or request bodies beyond the current V0.3 configuration
+- WebSockets
+- Redis
+- distributed execution
 
-The execution engine is intentionally synchronous and in-memory. V0.5 introduces persistence for executions and node-level execution state.
+V0.5 also does not yet make workflow definitions immutable historical snapshots. Executions persist the workflow-version identity, while the current workflow-definition editing model remains mutable. Strong immutable versioning is a later architectural concern.
 
 ## Architecture
 
@@ -277,7 +370,7 @@ React + TypeScript + Vite
       PostgreSQL
 ```
 
-The backend remains a **modular monolith**. V0.4 adds execution as a separate logical backend package within the same Spring Boot application rather than introducing a separate worker service.
+The backend remains a **modular monolith**. V0.5 keeps execution as a separate logical backend package and adds a persistence subpackage plus query API within the same Spring Boot application rather than introducing a separate worker service.
 
 The architecture will become more distributed only when a concrete scaling, reliability, or execution requirement justifies it.
 
@@ -330,7 +423,7 @@ The definition endpoint persists the current visual graph, including node IDs, t
 POST /api/workflows/{workflowId}/execute
 ```
 
-The endpoint executes the workflow's current persisted definition synchronously.
+The endpoint executes the workflow's current persisted definition synchronously and returns the persisted execution ID.
 
 Optional trigger data can be supplied:
 
@@ -344,9 +437,22 @@ Optional trigger data can be supplied:
 
 The request body may also be omitted; trigger data defaults to an empty map.
 
-The response contains execution success, node outputs, and an error message when execution fails.
+The response contains an `executionId`, execution success, node outputs, and an error message when execution fails.
 
-Execution failures use `success: false` with an empty `outputs` object. Unknown workflow IDs remain HTTP 404 resource-not-found responses.
+Execution failures use `success: false` with an empty `outputs` object. The execution is still persisted and can be queried through the execution history/detail APIs.
+
+Unknown workflow IDs remain HTTP 404 resource-not-found responses.
+
+### Execution History
+
+```text
+GET /api/workflows/{workflowId}/executions
+GET /api/executions/{executionId}
+```
+
+The first endpoint lists persisted executions for a workflow, newest first.
+
+The second endpoint returns one execution with its trigger data, node execution records, and lifecycle events.
 
 ### Health
 
@@ -379,6 +485,7 @@ V0.4 does not introduce a database migration. Execution state remains in memory 
 V1__create_users_and_workflows.sql
 V2__create_workflow_definitions.sql
 V3__add_start_nodes_to_workflows.sql
+V4__create_execution_persistence.sql
 ```
 
 **Applied migrations must not be edited.** Future schema changes require new migrations.
@@ -414,7 +521,7 @@ Backend:
 http://localhost:8080
 ```
 
-### V0.4 Execution Verification
+### V0.5 Execution Verification
 
 The V0.4 execution path was verified with:
 
@@ -425,7 +532,7 @@ The V0.4 execution path was verified with:
 The complete backend suite passed:
 
 ```text
-Tests run: 86
+Tests run: 100
 Failures: 0
 Errors: 0
 Skipped: 0
@@ -463,7 +570,7 @@ http://localhost:5173
 
 ### Backend
 
-V0.4 backend verification completed successfully with:
+V0.5 backend verification completed successfully with:
 
 ```powershell
 .\mvnw.cmd -q test
@@ -550,17 +657,126 @@ This verifies the validation-before-persistence safety boundary.
 
 ## Documentation
 
-### Architecture
+### V0.5 — Execution Persistence
+
+### Goal
+
+V0.5 answers:
+
+> Can FlowForge keep a durable record of workflow executions and their node-level outcomes while retaining the simple synchronous execution model?
+
+The answer is yes.
+
+### Implemented and verified
+
+- PostgreSQL-backed `executions` table
+- Workflow-version reference on every execution
+- Execution lifecycle status: `RUNNING`, `SUCCESS`, `FAILED`
+- Persisted trigger data
+- Execution start/completion timestamps
+- Persisted execution-level error message
+- PostgreSQL-backed `execution_nodes` table
+- Node lifecycle status: `RUNNING`, `SUCCESS`, `FAILED`
+- Persisted node outputs and node-level errors
+- PostgreSQL-backed `execution_events` table
+- Execution lifecycle events
+- Node start/completion/failure events
+- Execution history API
+- Execution detail API
+- Stable execution ID returned by the execution endpoint
+- Lifecycle listener boundary between the execution engine and persistence
+- Synchronous execution remains unchanged in its request/response model
+- Failure-path persistence integration coverage
+- Full backend test suite verification: **100 tests, 0 failures, 0 errors**
+
+### Persistence model
+
+```text
+WorkflowVersion
+      |
+      +---- Execution
+               |
+               +---- ExecutionNode
+               |
+               +---- ExecutionEvent
+```
+
+An execution stores the exact workflow-version ID used by the execution service. Node records and events reference execution IDs and node UUIDs.
+
+### Execution lifecycle
+
+```text
+create execution
+      |
+      v
+RUNNING
+      |
+      +--> NODE_STARTED
+      |        |
+      |        v
+      |   node execution
+      |        |
+      |   +----+----+
+      |   |         |
+      | success   failure
+      |   |         |
+      |   v         v
+      | NODE_     NODE_
+      | COMPLETED FAILED
+      |   |
+      +---+
+          |
+          v
+ EXECUTION_COMPLETED
+          |
+          v
+       SUCCESS
+```
+
+A workflow failure records the failed execution and node state before the request returns.
+
+### Execution history API
+
+```text
+GET /api/workflows/{workflowId}/executions
+GET /api/executions/{executionId}
+```
+
+The workflow-scoped endpoint returns executions ordered newest first.
+
+The detail endpoint returns the execution lifecycle state, trigger data, node execution records, and ordered execution events.
+
+### Important V0.5 boundary
+
+V0.5 remains synchronous.
+
+It deliberately does not add:
+
+- RabbitMQ
+- asynchronous execution
+- worker processes
+- retries
+- idempotency
+- scheduling
+- WebSockets
+- Redis
+- distributed execution
+
+V0.5 also does not yet make workflow definitions immutable historical snapshots. Executions persist the workflow-version identity, while the current workflow-definition editing model remains mutable. Strong immutable versioning is a later architectural concern.
+
+## Architecture
 
 - [`docs/architecture/v0.1-architecture.md`](docs/architecture/v0.1-architecture.md)
 - [`docs/architecture/v0.2-architecture.md`](docs/architecture/v0.2-architecture.md)
 - [`docs/architecture/v0.3-architecture.md`](docs/architecture/v0.3-architecture.md)
 - [`docs/architecture/v0.4-architecture.md`](docs/architecture/v0.4-architecture.md)
+- [`docs/architecture/v0.5-architecture.md`](docs/architecture/v0.5-architecture.md)
 
 ### API
 
 - [`docs/api/workflow-definition.md`](docs/api/workflow-definition.md)
 - [`docs/api/workflow-execution.md`](docs/api/workflow-execution.md)
+- [`docs/api/execution-history.md`](docs/api/execution-history.md)
 
 ### Architecture Decision Records
 
@@ -569,12 +785,16 @@ This verifies the validation-before-persistence safety boundary.
 - [`docs/decisions/ADR-003-modular-monolith.md`](docs/decisions/ADR-003-modular-monolith.md)
 - [`docs/decisions/ADR-004-monorepo.md`](docs/decisions/ADR-004-monorepo.md)
 - [`docs/decisions/ADR-005-flyway.md`](docs/decisions/ADR-005-flyway.md)
+- [`docs/decisions/ADR-006-workflow-definition-validation.md`](docs/decisions/ADR-006-workflow-definition-validation.md)
+- [`docs/decisions/ADR-007-synchronous-workflow-execution.md`](docs/decisions/ADR-007-synchronous-workflow-execution.md)
+- [`docs/decisions/ADR-008-execution-persistence.md`](docs/decisions/ADR-008-execution-persistence.md)
 
 ### Diagrams
 
 - [`docs/diagrams/workflow-definition-v0.2.md`](docs/diagrams/workflow-definition-v0.2.md)
 - [`docs/diagrams/workflow-definition-v0.3-validation.md`](docs/diagrams/workflow-definition-v0.3-validation.md)
 - [`docs/diagrams/workflow-execution-v0.4.md`](docs/diagrams/workflow-execution-v0.4.md)
+- [`docs/diagrams/execution-persistence-v0.5.md`](docs/diagrams/execution-persistence-v0.5.md)
 
 ## Architecture Evolution
 
@@ -585,9 +805,7 @@ V0.2  Visual Workflow Builder
   ↓
 V0.3  Workflow Validation
   ↓
-V0.4  Synchronous Execution Engine   ← current
-  ↓
-V0.5  Execution Persistence
+V0.5  Execution Persistence   ← current
   ↓
 V0.6  Asynchronous Execution
   ↓
@@ -607,8 +825,6 @@ The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worke
 
 ## Next Version
 
-**V0.5 — Execution Persistence**
+**V0.6 — Asynchronous Execution**
 
-V0.5 will persist workflow executions, node-level execution state, and execution outcomes so that execution history survives the request lifecycle and application restarts.
-
-The V0.5 design will build on the synchronous execution engine established in V0.4 rather than replacing it with asynchronous infrastructure prematurely.
+V0.6 will address the request-lifecycle limitation of synchronous execution by introducing asynchronous execution and RabbitMQ. Workers remain a separate concern for V0.7.
