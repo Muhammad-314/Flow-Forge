@@ -6,7 +6,7 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.6 — Asynchronous Execution**
+**V0.7 — Controlled Concurrent Worker Execution**
 
 V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system.
 
@@ -357,6 +357,139 @@ It deliberately does not add:
 
 V0.5 also does not yet make workflow definitions immutable historical snapshots. Executions persist the workflow-version identity, while the current workflow-definition editing model remains mutable. Strong immutable versioning is a later architectural concern.
 
+## V0.7 — Controlled Concurrent Worker Execution
+
+### Goal
+
+V0.7 answers:
+
+> Can FlowForge process multiple queued workflow executions concurrently while keeping execution state isolated and the worker model deliberately simple?
+
+The answer is yes.
+
+### Implemented and verified
+
+- Configurable Spring AMQP listener concurrency
+- Fixed worker-listener concurrency of **3** for the current local deployment
+- `concurrency: 3` and `max-concurrency: 3` in `application.yml`
+- Three active RabbitMQ consumers attached to `flowforge.execution.queue`
+- Per-consumer RabbitMQ prefetch remains **250**
+- Existing `ExecutionJob(UUID executionId)` message contract is unchanged
+- Existing `ExecutionJobConsumer → ExecutionWorkerService → WorkflowExecutionEngine` boundary is unchanged
+- No additional `ExecutorService` was introduced inside the consumer or worker
+- Multiple executions can enter `ExecutionWorkerService.process(...)` concurrently
+- `ExecutionContext` remains per-execution and mutable state is not shared between concurrent executions
+- Executor registry remains read-only after construction and is safe for concurrent executor lookup
+- Concurrent integration test uses three blocked local HTTP executions to prove that all three workers can run at the same time
+- Integration test verifies that all three executions reach `RUNNING` concurrently and later complete successfully
+- Integration test verifies trigger-data isolation between concurrent executions
+- Full backend test suite verification: **105 tests, 0 failures, 0 errors**
+
+### Worker model
+
+V0.7 does **not** create three worker processes or three microservices.
+
+There is still one Spring Boot application:
+
+```text
+                 Spring Boot application
+                         |
+                  RabbitMQ listener
+                  concurrency = 3
+                         |
+             +-----------+-----------+
+             |           |           |
+             v           v           v
+          Consumer    Consumer    Consumer
+             |           |           |
+             +-----------+-----------+
+                         |
+                 ExecutionWorkerService
+                         |
+                 WorkflowExecutionEngine
+```
+
+The three listener invokers are concurrent consumers within the same application process. Each consumer can process one delivered execution while the workflow engine is running.
+
+### Concurrency and execution isolation
+
+Each asynchronous job contains only an execution ID:
+
+```java
+public record ExecutionJob(UUID executionId) {}
+```
+
+The worker reloads the execution and exact workflow-version data from PostgreSQL before execution.
+
+Each engine invocation creates its own `ExecutionContext`. Execution-specific variables, trigger data, node outputs, and metadata therefore remain local to that invocation rather than being stored in singleton engine fields.
+
+The shared `WorkflowNodeExecutorRegistry` is constructed once and is not mutated during execution. Individual executors currently used by FlowForge do not store per-execution mutable state in instance fields.
+
+### Prefetch boundary
+
+RabbitMQ reports:
+
+```text
+consumer count:     3
+prefetch per consumer: 250
+```
+
+A prefetch value of 250 does **not** mean that 750 workflow executions are running simultaneously. It controls how many messages a consumer may have delivered and not yet acknowledged. Actual active workflow execution is bounded by the listener concurrency.
+
+V0.7 therefore keeps the existing prefetch configuration unchanged rather than treating prefetch as the worker-count setting.
+
+### Graceful shutdown boundary
+
+V0.7 relies on the Spring AMQP listener-container lifecycle rather than introducing a custom worker executor or shutdown framework.
+
+The listener container is responsible for stopping its consumers during application shutdown. With the current configuration, `force-stop` is not enabled, so the listener container is not being changed to forcibly interrupt normal message processing as part of this version.
+
+V0.7 documents the lifecycle boundary but does not claim transactional recovery, retry, or exactly-once completion semantics. Those concerns remain later reliability/idempotency work.
+
+### V0.7 boundary
+
+V0.7 deliberately does not include:
+
+- separate worker processes
+- microservices
+- horizontal worker deployment
+- retry policies
+- dead-letter queues
+- idempotency or deduplication
+- transactional outbox
+- exactly-once delivery
+- distributed locking
+- workflow-level parallel branching
+- dynamic autoscaling
+- Redis or another worker-coordination store
+
+The goal is controlled in-process concurrency, not a distributed worker platform.
+
+### Local verification
+
+Start the backend:
+
+```powershell
+.\mvnw.cmd spring-boot:run
+```
+
+In another terminal, verify the RabbitMQ consumers:
+
+```powershell
+docker exec flowforge-rabbitmq rabbitmqctl list_consumers
+```
+
+Expected local state:
+
+```text
+queue_name                    ack_required  prefetch_count  active
+flowforge.execution.queue     true          250             true
+flowforge.execution.queue     true          250             true
+flowforge.execution.queue     true          250             true
+```
+
+The V0.7 integration test provides behavioral verification by submitting three executions whose HTTP nodes block until all three requests have started. The test then releases them and verifies that all three complete successfully with isolated trigger data.
+
 ## Architecture
 
 ```text
@@ -370,7 +503,7 @@ React + TypeScript + Vite
       PostgreSQL
 ```
 
-The backend remains a **modular monolith**. V0.5 keeps execution as a separate logical backend package and adds a persistence subpackage plus query API within the same Spring Boot application rather than introducing a separate worker service.
+The backend remains a **modular monolith**. V0.7 keeps API handling, RabbitMQ consumption, worker orchestration, and workflow execution within the same Spring Boot application. Worker concurrency is provided by the Spring AMQP listener container rather than by separate worker processes or services.
 
 The architecture will become more distributed only when a concrete scaling, reliability, or execution requirement justifies it.
 
@@ -569,6 +702,34 @@ http://localhost:5173
 ## Testing and Verification
 
 ### Backend
+
+The current V0.7 backend verification completed successfully with:
+
+```powershell
+.\mvnw.cmd test
+```
+
+The full backend suite passed with:
+
+```text
+Tests run: 105
+Failures: 0
+Errors: 0
+Skipped: 0
+BUILD SUCCESS
+```
+
+V0.7 additionally verifies:
+
+- three active RabbitMQ consumers
+- actual concurrent execution of three workflow jobs
+- simultaneous `RUNNING` state for the three executions
+- isolated trigger data across concurrent executions
+- successful completion of all concurrent executions
+
+Historical version-specific verification details remain documented below.
+
+### Historical V0.5 verification
 
 V0.5 backend verification completed successfully with:
 
@@ -805,11 +966,13 @@ V0.2  Visual Workflow Builder
   ↓
 V0.3  Workflow Validation
   ↓
-V0.5  Execution Persistence   ← current
+V0.4  Synchronous Execution Engine
+  ↓
+V0.5  Execution Persistence
   ↓
 V0.6  Asynchronous Execution
   ↓
-V0.7  Worker Pool
+V0.7  Controlled Concurrent Worker Execution   ← current
   ↓
 V0.8  Reliability
   ↓
@@ -821,13 +984,13 @@ V0.10 Scheduling
 V1.0 Production-Grade FlowForge
 ```
 
-The project deliberately avoids premature infrastructure. RabbitMQ, Redis, workers, schedulers, WebSockets, microservices, Kubernetes, and other distributed components will be introduced only when a later version creates a concrete engineering problem that requires them.
+The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worker pools, schedulers, WebSockets, microservices, Kubernetes, and other distributed components are introduced only when a concrete engineering problem justifies them.
 
 ## Next Version
 
-**V0.6 — Asynchronous Execution**
+**V0.8 — Reliability**
 
-V0.6 will address the request-lifecycle limitation of synchronous execution by introducing asynchronous execution and RabbitMQ. Workers remain a separate concern for V0.7.
+V0.8 will address reliability concerns around asynchronous execution, including failure/recovery behavior at the PostgreSQL-to-RabbitMQ boundary. It remains separate from V0.7's concurrency concerns.
 
 
 ## V0.6 — Asynchronous Execution
