@@ -6,9 +6,9 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.7 — Controlled Concurrent Worker Execution**
+**V0.8 — Reliability
 
-V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system.
+V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.8 is the current completed reliability checkpoint.
 
 ## V0.1 — Foundation
 
@@ -712,6 +712,183 @@ flowforge.execution.queue     true          250             true
 
 The V0.7 integration test provides behavioral verification by submitting three executions whose HTTP nodes block until all three requests have started. The test then releases them and verifies that all three complete successfully with isolated trigger data.
 
+
+## V0.8 — Reliability
+
+### Goal
+
+V0.8 answers:
+
+> Can FlowForge recover from transient workflow failures without retrying forever, while preserving durable execution state and keeping RabbitMQ failure handling explicit?
+
+The answer is yes.
+
+V0.8 adds reliability behavior on top of the V0.6 asynchronous execution path and V0.7 controlled concurrency model.
+
+### Implemented and verified
+
+- Explicit node failure classification:
+  - `TRANSIENT`
+  - `PERMANENT`
+  - `UNKNOWN`
+- HTTP failure classification:
+  - `408` and `429` → transient
+  - `5xx` → transient
+  - other `4xx` → permanent
+  - I/O failures → transient
+  - invalid request configuration → permanent
+- Persisted execution attempt tracking
+- Persisted maximum-attempt limit
+- Persisted `nextRetryAt`
+- Default maximum attempts: **3**
+- Exponential retry backoff:
+  - attempt 1 failure → 2 seconds
+  - attempt 2 failure → 4 seconds
+  - further retries continue with the same exponential policy, bounded by the configured listener retry behavior
+- Retry lifecycle event: `EXECUTION_RETRY_SCHEDULED`
+- Attempt-aware node execution persistence so retries do not collide with previous node records
+- Node timeout of **30 seconds**
+- Timed-out node executions classified as transient
+- Timeout cancellation/interruption handling
+- Spring AMQP listener retry for explicitly retryable execution failures
+- Non-retryable execution failures are not retried by the RabbitMQ listener
+- Durable RabbitMQ dead-letter exchange and dead-letter queue
+- Exhausted transient executions are marked `FAILED` and the original job is rejected so RabbitMQ routes it to the DLQ
+- PostgreSQL remains the source of truth; RabbitMQ remains the asynchronous transport
+- V0.7's three-consumer concurrency model remains unchanged
+- Focused reliability tests, integration tests, retry/DLQ tests, and the full backend suite all pass
+- Final full backend verification: **119 tests, 0 failures, 0 errors, 0 skipped**
+
+### Reliability flow
+
+```text
+ExecutionJob
+    |
+    v
+RabbitMQ execution queue
+    |
+    v
+ExecutionWorkerService
+    |
+    v
+mark RUNNING
+(attempt increments)
+    |
+    v
+WorkflowExecutionEngine
+    |
+    +--> SUCCESS
+    |      |
+    |      v
+    |   SUCCESS
+    |
+    +--> TRANSIENT FAILURE
+    |      |
+    |      +--> attempts remain
+    |      |       |
+    |      |       v
+    |      |   QUEUED + nextRetryAt
+    |      |       |
+    |      |       v
+    |      |   retryable exception
+    |      |       |
+    |      |       v
+    |      |   Rabbit listener retry
+    |      |
+    |      +--> max attempts reached
+    |              |
+    |              v
+    |           FAILED
+    |              |
+    |              v
+    |           reject / don't requeue
+    |              |
+    |              v
+    |           RabbitMQ DLX
+    |              |
+    |              v
+    |             DLQ
+    |
+    +--> PERMANENT / UNKNOWN FAILURE
+           |
+           v
+        FAILED
+           |
+           v
+        reject / don't requeue
+```
+
+### Attempt semantics
+
+`Execution.attempt` is the number of actual execution attempts that have entered `RUNNING`.
+
+An execution is created with:
+
+```text
+attempt = 0
+maxAttempts = 3
+status = QUEUED
+```
+
+When the worker begins an attempt:
+
+```text
+attempt 1 → RUNNING
+attempt 2 → RUNNING
+attempt 3 → RUNNING
+```
+
+A retry is scheduled only while `attempt < maxAttempts`.
+
+Node persistence is keyed by:
+
+```text
+execution_id + node_id + attempt
+```
+
+This allows each retry attempt to retain its own node lifecycle records without violating uniqueness.
+
+### Timeout boundary
+
+Each node execution has a 30-second timeout.
+
+A timeout:
+
+1. cancels/interupts the node task;
+2. returns a transient execution failure;
+3. follows the normal retry policy if attempts remain.
+
+The timeout is a node-execution boundary, not a global workflow deadline.
+
+### RabbitMQ reliability topology
+
+```text
+flowforge.execution
+        |
+        | execution.created
+        v
+flowforge.execution.queue
+        |
+        | reject after retry policy is exhausted
+        v
+flowforge.execution.dlx
+        |
+        | execution.failed
+        v
+flowforge.execution.dlq
+```
+
+The DLQ is for jobs that the listener ultimately rejects without requeueing. It is not a second source of truth for execution state.
+
+### Important reliability boundary
+
+V0.8 does **not** claim exactly-once execution.
+
+A workflow node can have externally visible side effects before a failure is observed. Idempotency and deduplication are therefore intentionally deferred to V0.9.
+
+V0.8 also does not introduce a transactional outbox or durable scheduler. A future crash between a PostgreSQL state transition and message publication remains a separate reliability concern.
+
+
 ## Architecture
 
 ```text
@@ -792,7 +969,7 @@ Optional trigger data can be supplied:
 
 The request body may also be omitted; trigger data defaults to an empty map.
 
-The response contains an `executionId` and its current status. Node outputs and terminal execution state are available through the execution-detail API.
+The response contains an `executionId` and its current status. Node outputs, retry state, and terminal execution state are available through the execution-detail API.
 
 Execution completion is persisted independently of the initial request. Clients can query the execution detail endpoint after the `202 Accepted` response.
 
@@ -841,6 +1018,8 @@ V1__create_users_and_workflows.sql
 V2__create_workflow_definitions.sql
 V3__add_start_nodes_to_workflows.sql
 V4__create_execution_persistence.sql
+V5__add_execution_retry_state.sql
+V6__make_execution_nodes_attempt_aware.sql
 ```
 
 **Applied migrations must not be edited.** Future schema changes require new migrations.
@@ -925,7 +1104,7 @@ http://localhost:5173
 
 ### Backend
 
-The current V0.7 backend verification completed successfully with:
+The current V0.8 backend verification completed successfully with:
 
 ```powershell
 .\mvnw.cmd test
@@ -934,7 +1113,7 @@ The current V0.7 backend verification completed successfully with:
 The full backend suite passed with:
 
 ```text
-Tests run: 105
+Tests run: 119
 Failures: 0
 Errors: 0
 Skipped: 0
@@ -948,6 +1127,10 @@ V0.7 additionally verifies:
 - simultaneous `RUNNING` state for the three executions
 - isolated trigger data across concurrent executions
 - successful completion of all concurrent executions
+- transient retry and attempt tracking
+- exponential backoff
+- node timeout behavior
+- dead-letter routing after retry exhaustion
 
 Historical version-specific verification details remain documented below.
 
@@ -1147,6 +1330,183 @@ It deliberately does not add:
 
 V0.5 also does not yet make workflow definitions immutable historical snapshots. Executions persist the workflow-version identity, while the current workflow-definition editing model remains mutable. Strong immutable versioning is a later architectural concern.
 
+
+## V0.8 — Reliability
+
+### Goal
+
+V0.8 answers:
+
+> Can FlowForge recover from transient workflow failures without retrying forever, while preserving durable execution state and keeping RabbitMQ failure handling explicit?
+
+The answer is yes.
+
+V0.8 adds reliability behavior on top of the V0.6 asynchronous execution path and V0.7 controlled concurrency model.
+
+### Implemented and verified
+
+- Explicit node failure classification:
+  - `TRANSIENT`
+  - `PERMANENT`
+  - `UNKNOWN`
+- HTTP failure classification:
+  - `408` and `429` → transient
+  - `5xx` → transient
+  - other `4xx` → permanent
+  - I/O failures → transient
+  - invalid request configuration → permanent
+- Persisted execution attempt tracking
+- Persisted maximum-attempt limit
+- Persisted `nextRetryAt`
+- Default maximum attempts: **3**
+- Exponential retry backoff:
+  - attempt 1 failure → 2 seconds
+  - attempt 2 failure → 4 seconds
+  - further retries continue with the same exponential policy, bounded by the configured listener retry behavior
+- Retry lifecycle event: `EXECUTION_RETRY_SCHEDULED`
+- Attempt-aware node execution persistence so retries do not collide with previous node records
+- Node timeout of **30 seconds**
+- Timed-out node executions classified as transient
+- Timeout cancellation/interruption handling
+- Spring AMQP listener retry for explicitly retryable execution failures
+- Non-retryable execution failures are not retried by the RabbitMQ listener
+- Durable RabbitMQ dead-letter exchange and dead-letter queue
+- Exhausted transient executions are marked `FAILED` and the original job is rejected so RabbitMQ routes it to the DLQ
+- PostgreSQL remains the source of truth; RabbitMQ remains the asynchronous transport
+- V0.7's three-consumer concurrency model remains unchanged
+- Focused reliability tests, integration tests, retry/DLQ tests, and the full backend suite all pass
+- Final full backend verification: **119 tests, 0 failures, 0 errors, 0 skipped**
+
+### Reliability flow
+
+```text
+ExecutionJob
+    |
+    v
+RabbitMQ execution queue
+    |
+    v
+ExecutionWorkerService
+    |
+    v
+mark RUNNING
+(attempt increments)
+    |
+    v
+WorkflowExecutionEngine
+    |
+    +--> SUCCESS
+    |      |
+    |      v
+    |   SUCCESS
+    |
+    +--> TRANSIENT FAILURE
+    |      |
+    |      +--> attempts remain
+    |      |       |
+    |      |       v
+    |      |   QUEUED + nextRetryAt
+    |      |       |
+    |      |       v
+    |      |   retryable exception
+    |      |       |
+    |      |       v
+    |      |   Rabbit listener retry
+    |      |
+    |      +--> max attempts reached
+    |              |
+    |              v
+    |           FAILED
+    |              |
+    |              v
+    |           reject / don't requeue
+    |              |
+    |              v
+    |           RabbitMQ DLX
+    |              |
+    |              v
+    |             DLQ
+    |
+    +--> PERMANENT / UNKNOWN FAILURE
+           |
+           v
+        FAILED
+           |
+           v
+        reject / don't requeue
+```
+
+### Attempt semantics
+
+`Execution.attempt` is the number of actual execution attempts that have entered `RUNNING`.
+
+An execution is created with:
+
+```text
+attempt = 0
+maxAttempts = 3
+status = QUEUED
+```
+
+When the worker begins an attempt:
+
+```text
+attempt 1 → RUNNING
+attempt 2 → RUNNING
+attempt 3 → RUNNING
+```
+
+A retry is scheduled only while `attempt < maxAttempts`.
+
+Node persistence is keyed by:
+
+```text
+execution_id + node_id + attempt
+```
+
+This allows each retry attempt to retain its own node lifecycle records without violating uniqueness.
+
+### Timeout boundary
+
+Each node execution has a 30-second timeout.
+
+A timeout:
+
+1. cancels/interupts the node task;
+2. returns a transient execution failure;
+3. follows the normal retry policy if attempts remain.
+
+The timeout is a node-execution boundary, not a global workflow deadline.
+
+### RabbitMQ reliability topology
+
+```text
+flowforge.execution
+        |
+        | execution.created
+        v
+flowforge.execution.queue
+        |
+        | reject after retry policy is exhausted
+        v
+flowforge.execution.dlx
+        |
+        | execution.failed
+        v
+flowforge.execution.dlq
+```
+
+The DLQ is for jobs that the listener ultimately rejects without requeueing. It is not a second source of truth for execution state.
+
+### Important reliability boundary
+
+V0.8 does **not** claim exactly-once execution.
+
+A workflow node can have externally visible side effects before a failure is observed. Idempotency and deduplication are therefore intentionally deferred to V0.9.
+
+V0.8 also does not introduce a transactional outbox or durable scheduler. A future crash between a PostgreSQL state transition and message publication remains a separate reliability concern.
+
+
 ## Architecture
 
 - [`docs/architecture/v0.1-architecture.md`](docs/architecture/v0.1-architecture.md)
@@ -1194,9 +1554,9 @@ V0.5  Execution Persistence
   ↓
 V0.6  Asynchronous Execution
   ↓
-V0.7  Controlled Concurrent Worker Execution   ← current
+V0.7  Controlled Concurrent Worker Execution
   ↓
-V0.8  Reliability
+V0.8  Reliability   ← current
   ↓
 V0.9  Idempotency
   ↓
@@ -1210,6 +1570,6 @@ The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worke
 
 ## Next Version
 
-**V0.8 — Reliability**
+**V0.9 — Idempotency**
 
-V0.8 will address reliability concerns around asynchronous execution, including failure/recovery behavior at the PostgreSQL-to-RabbitMQ boundary. It remains separate from V0.7's concurrency concerns.
+V0.9 will address duplicate-delivery and duplicate-execution protection. It remains separate from V0.8's retry, timeout, and dead-letter concerns.
