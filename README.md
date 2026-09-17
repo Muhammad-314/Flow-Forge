@@ -6,9 +6,9 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.8 — Reliability
+**V0.9 — Idempotency**
 
-V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.8 is the current completed reliability checkpoint.
+V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.9 is the current completed idempotency checkpoint.
 
 ## V0.1 — Foundation
 
@@ -889,6 +889,157 @@ A workflow node can have externally visible side effects before a failure is obs
 V0.8 also does not introduce a transactional outbox or durable scheduler. A future crash between a PostgreSQL state transition and message publication remains a separate reliability concern.
 
 
+
+## V0.9 — Idempotency
+
+### Goal
+
+V0.9 answers:
+
+> Can FlowForge safely tolerate duplicate RabbitMQ deliveries without executing the same persisted workflow execution more than once?
+
+The answer is yes, within the execution-claim boundary implemented by PostgreSQL.
+
+V0.9 builds on V0.8's at-least-once RabbitMQ and bounded-retry model. It does not attempt to turn RabbitMQ into an exactly-once transport.
+
+### Implemented and verified
+
+- Atomic PostgreSQL execution claim using a conditional `UPDATE`
+- `QUEUED -> RUNNING` claim boundary guarded by execution status
+- Attempt-limit guard during claiming
+- Atomic attempt increment at the claim boundary
+- `tryMarkExecutionRunning(...)` returning an explicit claim result
+- Duplicate delivery after `SUCCESS` is ignored
+- Duplicate delivery while `RUNNING` is ignored
+- Duplicate delivery during a retry attempt is ignored
+- Concurrent workers racing for the same queued execution produce exactly one successful claim
+- Duplicate claims do not create duplicate execution-start processing
+- Duplicate claims do not produce duplicate external HTTP execution in the tested scenarios
+- Existing V0.8 retry and DLQ behavior remains intact
+- PostgreSQL remains the source of truth
+- RabbitMQ remains the asynchronous transport
+- No second broker, distributed lock, Redis coordinator, worker service, or microservice boundary introduced
+- Focused idempotency unit/integration tests
+- RabbitMQ duplicate-delivery integration coverage
+- Database concurrency integration coverage
+- Full backend verification: **127 tests, 0 failures, 0 errors, 0 skipped**
+
+### Idempotent execution claim
+
+The worker does not blindly transition an execution to `RUNNING`.
+
+Instead, PostgreSQL performs an atomic conditional update equivalent to:
+
+```text
+UPDATE executions
+SET status = RUNNING,
+    attempt = attempt + 1
+WHERE id = executionId
+  AND status = QUEUED
+  AND attempt < maxAttempts
+```
+
+The affected-row count is the claim result:
+
+```text
+1 row updated -> this worker owns the execution attempt
+0 rows updated -> execution is not claimable; treat as duplicate/non-runnable delivery
+```
+
+This makes the database transition itself the concurrency boundary.
+
+### Execution state semantics
+
+```text
+new execution
+    |
+    v
+QUEUED / attempt 0
+    |
+    | successful atomic claim
+    v
+RUNNING / attempt 1
+    |
+    +----------------------+
+    |                      |
+ success              transient failure
+    |                      |
+    v                      v
+ SUCCESS             QUEUED / attempt 1
+                           |
+                           | retry claim
+                           v
+                      RUNNING / attempt 2
+```
+
+A retry reuses the same execution ID. The retry transition returns the execution to `QUEUED` without incrementing the attempt. The next successful claim increments the attempt when it enters `RUNNING`.
+
+### Duplicate-delivery behavior
+
+A duplicate `ExecutionJob` contains the same persisted execution ID.
+
+If the original execution is already:
+
+```text
+RUNNING
+SUCCESS
+FAILED
+```
+
+or otherwise not claimable, the conditional database update affects zero rows and the worker returns without invoking the workflow engine.
+
+For a duplicate that races with an original worker while the execution is `RUNNING`, only the worker that wins the `QUEUED -> RUNNING` database claim can proceed.
+
+### Why this is not literal exactly-once execution
+
+V0.9 establishes an idempotent execution-claim boundary for the persisted FlowForge execution.
+
+It does **not** establish universal exactly-once side effects.
+
+For example, an external system may receive a request before a process failure is observed. A later retry or a separate workflow execution could still produce an externally visible side effect unless that external operation is itself idempotent or otherwise coordinated.
+
+RabbitMQ also remains an at-least-once transport. Duplicate messages can still exist; the application prevents those duplicates from becoming duplicate processing of the same claimable execution.
+
+### Verification
+
+V0.9 was verified with:
+
+- duplicate-after-success integration testing;
+- duplicate-while-running integration testing;
+- duplicate-during-retry integration testing;
+- repository-level concurrent claim testing;
+- persistence-service concurrent claim testing;
+- existing V0.8 retry/DLQ integration testing;
+- complete backend regression suite.
+
+Final full-suite result:
+
+```text
+Tests run: 127
+Failures: 0
+Errors: 0
+Skipped: 0
+BUILD SUCCESS
+```
+
+### V0.9 boundary
+
+V0.9 deliberately does not add:
+
+- literal exactly-once delivery;
+- universal exactly-once external side effects;
+- transactional outbox;
+- durable scheduling;
+- distributed locks;
+- idempotency keys for arbitrary external APIs;
+- automatic deduplication across different execution IDs;
+- cancellation;
+- horizontal worker deployment;
+- workflow-level parallel branching.
+
+The next planned version is V0.10 Scheduling.
+
+
 ## Architecture
 
 ```text
@@ -1104,7 +1255,7 @@ http://localhost:5173
 
 ### Backend
 
-The current V0.8 backend verification completed successfully with:
+The current V0.9 backend verification completed successfully with:
 
 ```powershell
 .\mvnw.cmd test
@@ -1113,7 +1264,7 @@ The current V0.8 backend verification completed successfully with:
 The full backend suite passed with:
 
 ```text
-Tests run: 119
+Tests run: 127
 Failures: 0
 Errors: 0
 Skipped: 0
@@ -1131,6 +1282,11 @@ V0.7 additionally verifies:
 - exponential backoff
 - node timeout behavior
 - dead-letter routing after retry exhaustion
+- duplicate delivery after successful execution
+- duplicate delivery while an execution is running
+- duplicate delivery during a retry attempt
+- concurrent PostgreSQL execution-claim races
+- idempotent execution-claim persistence
 
 Historical version-specific verification details remain documented below.
 
@@ -1514,6 +1670,10 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/architecture/v0.3-architecture.md`](docs/architecture/v0.3-architecture.md)
 - [`docs/architecture/v0.4-architecture.md`](docs/architecture/v0.4-architecture.md)
 - [`docs/architecture/v0.5-architecture.md`](docs/architecture/v0.5-architecture.md)
+- [`docs/architecture/v0.6-architecture.md`](docs/architecture/v0.6-architecture.md)
+- [`docs/architecture/v0.7-architecture.md`](docs/architecture/v0.7-architecture.md)
+- [`docs/architecture/v0.8-architecture.md`](docs/architecture/v0.8-architecture.md)
+- [`docs/architecture/v0.9-architecture.md`](docs/architecture/v0.9-architecture.md)
 
 ### API
 
@@ -1531,6 +1691,10 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/decisions/ADR-006-workflow-definition-validation.md`](docs/decisions/ADR-006-workflow-definition-validation.md)
 - [`docs/decisions/ADR-007-synchronous-workflow-execution.md`](docs/decisions/ADR-007-synchronous-workflow-execution.md)
 - [`docs/decisions/ADR-008-execution-persistence.md`](docs/decisions/ADR-008-execution-persistence.md)
+- [`docs/decisions/ADR-009-rabbitmq-async-execution.md`](docs/decisions/ADR-009-rabbitmq-async-execution.md)
+- [`docs/decisions/ADR-010-controlled-concurrent-worker-execution.md`](docs/decisions/ADR-010-controlled-concurrent-worker-execution.md)
+- [`docs/decisions/ADR-011-execution-reliability.md`](docs/decisions/ADR-011-execution-reliability.md)
+- [`docs/decisions/ADR-012-execution-idempotency.md`](docs/decisions/ADR-012-execution-idempotency.md)
 
 ### Diagrams
 
@@ -1538,6 +1702,10 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/diagrams/workflow-definition-v0.3-validation.md`](docs/diagrams/workflow-definition-v0.3-validation.md)
 - [`docs/diagrams/workflow-execution-v0.4.md`](docs/diagrams/workflow-execution-v0.4.md)
 - [`docs/diagrams/execution-persistence-v0.5.md`](docs/diagrams/execution-persistence-v0.5.md)
+- [`docs/diagrams/async-execution-v0.6.md`](docs/diagrams/async-execution-v0.6.md)
+- [`docs/diagrams/worker-concurrency-v0.7.md`](docs/diagrams/worker-concurrency-v0.7.md)
+- [`docs/diagrams/reliability-v0.8.md`](docs/diagrams/reliability-v0.8.md)
+- [`docs/diagrams/idempotency-v0.9.md`](docs/diagrams/idempotency-v0.9.md)
 
 ## Architecture Evolution
 
@@ -1556,9 +1724,9 @@ V0.6  Asynchronous Execution
   ↓
 V0.7  Controlled Concurrent Worker Execution
   ↓
-V0.8  Reliability   ← current
+V0.8  Reliability
   ↓
-V0.9  Idempotency
+V0.9  Idempotency   ← current
   ↓
 V0.10 Scheduling
   ↓
@@ -1570,6 +1738,6 @@ The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worke
 
 ## Next Version
 
-**V0.9 — Idempotency**
+**V0.10 — Scheduling**
 
-V0.9 will address duplicate-delivery and duplicate-execution protection. It remains separate from V0.8's retry, timeout, and dead-letter concerns.
+V0.10 will address durable workflow scheduling. It remains separate from V0.9's duplicate-delivery and duplicate-execution protection.
