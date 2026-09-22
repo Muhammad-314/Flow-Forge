@@ -1040,6 +1040,30 @@ V0.9 deliberately does not add:
 The next planned version is V0.10 Scheduling.
 
 
+## Frontend V0.9 Checkpoint
+
+The frontend catch-up completed alongside the V0.9 backend checkpoint. This work connects the existing React application to the persisted asynchronous execution APIs without introducing new backend capabilities.
+
+Implemented and manually verified:
+
+- Workflow list, creation, editing, saving, and reopening of persisted workflow definitions
+- Workflow editor integration with asynchronous execution
+- `POST /api/workflows/{workflowId}/execute` handling with HTTP `202 Accepted`
+- Execution history loading and refresh after execution
+- Execution-detail routing through `/executions/{executionId}`
+- Execution-detail loading of execution, node, and event state
+- Live polling for `QUEUED` / `RUNNING` executions
+- Automatic polling termination at `SUCCESS` / `FAILED`
+- Lifecycle-safe cancellation of execution polling when the relevant page unmounts
+- Loading, empty, success, and error states across the workflow/execution flows
+- Attempt, maximum-attempt, and next-retry visibility in the frontend
+- Frontend production build and lint verification
+- End-to-end browser verification of workflow persistence and asynchronous execution
+
+The frontend does not introduce WebSockets, manual retry endpoints, scheduling, or new backend execution semantics. It observes the existing REST APIs.
+
+See [`docs/frontend-v0.9.md`](docs/frontend-v0.9.md) for the frontend checkpoint details.
+
 ## Architecture
 
 ```text
