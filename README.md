@@ -6,9 +6,9 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.9 — Idempotency**
+**V0.10 — Scheduling**
 
-V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.9 is the current completed idempotency checkpoint.
+V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.9 established the idempotent execution-claim boundary. V0.10 adds durable workflow scheduling and hands scheduled executions into the existing asynchronous execution pipeline.
 
 ## V0.1 — Foundation
 
@@ -1040,6 +1040,146 @@ V0.9 deliberately does not add:
 The next planned version is V0.10 Scheduling.
 
 
+## V0.10 — Scheduling
+
+### Goal
+
+V0.10 answers:
+
+> Can FlowForge durably schedule workflows and turn due schedule occurrences into normal persisted executions without introducing a second execution engine?
+
+The answer is yes.
+
+### Implemented and verified
+
+- Quartz Scheduler with JDBC job store and PostgreSQL persistence
+- Durable Quartz schema managed through Flyway
+- Application-level `schedules` persistence for workflow scheduling configuration
+- Persisted `schedule_occurrences` records for idempotent occurrence materialization
+- Cron-based schedules with explicit IANA time zones
+- Schedule lifecycle: create, update, enable, disable, delete
+- Durable Quartz jobs and cron triggers mapped to persisted FlowForge schedules
+- Due schedule occurrence materialization using a PostgreSQL row lock
+- Schedule-occurrence uniqueness on `(schedule_id, scheduled_for)`
+- Reuse of an existing occurrence's execution ID when the same occurrence is encountered again
+- Scheduled executions created from the workflow's current version
+- Scheduled executions reuse the existing `ExecutionPersistenceService`
+- Scheduled executions enter `QUEUED` and reuse the existing RabbitMQ execution pipeline
+- No second workflow execution engine introduced for scheduled workflows
+- REST API for schedule management
+- Workflow Editor schedule listing and schedule-management UI
+- Schedule enable/disable, edit, and delete controls in the frontend
+- End-to-end runtime verification with a one-minute cron schedule
+- Scheduled execution observed in the existing Execution History
+- Full backend regression verification: **158 tests, 0 failures, 0 errors, 0 skipped**
+- Frontend production build and lint verification: both green
+
+### Scheduling flow
+
+```text
+Quartz CronTrigger
+       |
+       v
+ScheduleQuartzJob
+       |
+       v
+ScheduleOccurrenceService
+       |
+       | PostgreSQL row lock
+       | occurrence(schedule_id, scheduled_for)
+       v
++-----------------------------+
+| existing occurrence?        |
+|                             |
+| yes -> reuse execution      |
+| no  -> create execution     |
++-----------------------------+
+       |
+       v
+ExecutionPersistenceService
+       |
+       | QUEUED
+       v
+RabbitMQ ExecutionJob
+       |
+       v
+Existing ExecutionWorkerService
+       |
+       v
+WorkflowExecutionEngine
+```
+
+Quartz is responsible for durable scheduling and firing schedule jobs. It is not the workflow execution engine.
+
+### Schedule API
+
+```text
+POST   /api/workflows/{workflowId}/schedules
+GET    /api/workflows/{workflowId}/schedules
+GET    /api/schedules/{scheduleId}
+PUT    /api/schedules/{scheduleId}
+POST   /api/schedules/{scheduleId}/enable
+POST   /api/schedules/{scheduleId}/disable
+DELETE /api/schedules/{scheduleId}
+```
+
+See [`docs/api/scheduling.md`](docs/api/scheduling.md).
+
+### Schedule persistence
+
+FlowForge stores scheduling configuration separately from Quartz's internal scheduler tables:
+
+```text
+Workflow
+   |
+   +-- Schedule
+         |
+         +-- ScheduleOccurrence
+                |
+                +-- Execution
+```
+
+The application tables are:
+
+```text
+schedules
+schedule_occurrences
+```
+
+Quartz's `QRTZ_*` tables remain scheduler infrastructure and are not the application-level source of truth for execution history.
+
+### Idempotent occurrence materialization
+
+A Quartz firing supplies:
+
+- `scheduleId`
+- `scheduledFor`
+
+The occurrence service locks the schedule row, checks whether `(scheduleId, scheduledFor)` already exists, and only creates a new execution plus occurrence when it does not.
+
+The database uniqueness constraint provides an additional persistence-level guard:
+
+```text
+UNIQUE (schedule_id, scheduled_for)
+```
+
+This is distinct from V0.9 execution-claim idempotency. V0.9 protects the same persisted execution from duplicate RabbitMQ delivery; V0.10 prevents the same scheduled occurrence from materializing multiple executions.
+
+### V0.10 boundary
+
+V0.10 deliberately does not add:
+
+- workflow-level branching or parallel execution;
+- a second workflow execution engine;
+- WebSockets or push scheduling updates;
+- distributed scheduler services;
+- dynamic worker scaling;
+- transactional outbox semantics;
+- universal exactly-once external side effects;
+- arbitrary external API idempotency keys.
+
+See [`docs/architecture/v0.10-architecture.md`](docs/architecture/v0.10-architecture.md), [`docs/decisions/ADR-013-durable-workflow-scheduling.md`](docs/decisions/ADR-013-durable-workflow-scheduling.md), and [`docs/v0.10-release-verification.md`](docs/v0.10-release-verification.md).
+
 ## Frontend V0.9 Checkpoint
 
 The frontend catch-up completed alongside the V0.9 backend checkpoint. This work connects the existing React application to the persisted asynchronous execution APIs without introducing new backend capabilities.
@@ -1279,7 +1419,7 @@ http://localhost:5173
 
 ### Backend
 
-The current V0.9 backend verification completed successfully with:
+The current V0.10 backend verification completed successfully with:
 
 ```powershell
 .\mvnw.cmd test
@@ -1288,7 +1428,7 @@ The current V0.9 backend verification completed successfully with:
 The full backend suite passed with:
 
 ```text
-Tests run: 127
+Tests run: 158
 Failures: 0
 Errors: 0
 Skipped: 0
@@ -1698,12 +1838,19 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/architecture/v0.7-architecture.md`](docs/architecture/v0.7-architecture.md)
 - [`docs/architecture/v0.8-architecture.md`](docs/architecture/v0.8-architecture.md)
 - [`docs/architecture/v0.9-architecture.md`](docs/architecture/v0.9-architecture.md)
+- [`docs/architecture/v0.10-architecture.md`](docs/architecture/v0.10-architecture.md)
+
+### Frontend
+
+- [`docs/frontend-v0.9.md`](docs/frontend-v0.9.md)
+- [`docs/frontend-v0.10.md`](docs/frontend-v0.10.md)
 
 ### API
 
 - [`docs/api/workflow-definition.md`](docs/api/workflow-definition.md)
 - [`docs/api/workflow-execution.md`](docs/api/workflow-execution.md)
 - [`docs/api/execution-history.md`](docs/api/execution-history.md)
+- [`docs/api/scheduling.md`](docs/api/scheduling.md)
 
 ### Architecture Decision Records
 
@@ -1719,6 +1866,8 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/decisions/ADR-010-controlled-concurrent-worker-execution.md`](docs/decisions/ADR-010-controlled-concurrent-worker-execution.md)
 - [`docs/decisions/ADR-011-execution-reliability.md`](docs/decisions/ADR-011-execution-reliability.md)
 - [`docs/decisions/ADR-012-execution-idempotency.md`](docs/decisions/ADR-012-execution-idempotency.md)
+- [`docs/decisions/ADR-013-durable-workflow-scheduling.md`](docs/decisions/ADR-013-durable-workflow-scheduling.md)
+- [`docs/frontend-v0.10.md`](docs/frontend-v0.10.md)
 
 ### Diagrams
 
@@ -1730,6 +1879,7 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/diagrams/worker-concurrency-v0.7.md`](docs/diagrams/worker-concurrency-v0.7.md)
 - [`docs/diagrams/reliability-v0.8.md`](docs/diagrams/reliability-v0.8.md)
 - [`docs/diagrams/idempotency-v0.9.md`](docs/diagrams/idempotency-v0.9.md)
+- [`docs/diagrams/scheduling-v0.10.md`](docs/diagrams/scheduling-v0.10.md)
 
 ## Architecture Evolution
 
@@ -1750,9 +1900,9 @@ V0.7  Controlled Concurrent Worker Execution
   ↓
 V0.8  Reliability
   ↓
-V0.9  Idempotency   ← current
+V0.9  Idempotency
   ↓
-V0.10 Scheduling
+V0.10 Scheduling   ← current
   ↓
 ...
 V1.0 Production-Grade FlowForge
@@ -1762,6 +1912,6 @@ The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worke
 
 ## Next Version
 
-**V0.10 — Scheduling**
+**V0.11 — TBD**
 
-V0.10 will address durable workflow scheduling. It remains separate from V0.9's duplicate-delivery and duplicate-execution protection.
+V0.10 is the current completed scheduling checkpoint. The next version will be defined after the V0.10 checkpoint is committed and pushed.
