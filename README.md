@@ -6,7 +6,7 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.10 — Scheduling**
+**V0.11 — Conditions + Branching**
 
 V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.9 established the idempotent execution-claim boundary. V0.10 adds durable workflow scheduling and hands scheduled executions into the existing asynchronous execution pipeline.
 
@@ -1180,6 +1180,79 @@ V0.10 deliberately does not add:
 
 See [`docs/architecture/v0.10-architecture.md`](docs/architecture/v0.10-architecture.md), [`docs/decisions/ADR-013-durable-workflow-scheduling.md`](docs/decisions/ADR-013-durable-workflow-scheduling.md), and [`docs/v0.10-release-verification.md`](docs/v0.10-release-verification.md).
 
+
+## V0.11 — Conditions + Branching
+
+### Goal
+
+V0.11 adds controlled conditional traversal to the workflow execution engine.
+
+### Implemented and verified
+
+- `condition` workflow node
+- Supported operators:
+  - `EQUALS`
+  - `NOT_EQUALS`
+  - `GREATER_THAN`
+  - `LESS_THAN`
+  - `CONTAINS`
+  - `EXISTS`
+- Explicit `TRUE` / `FALSE` branch metadata on condition edges
+- Backend validation requiring exactly one `TRUE` and one `FALSE` outgoing edge from a condition node
+- Backend validation rejecting branch labels on ordinary nodes
+- Dedicated `ConditionExecutor`
+- Execution-engine branch selection based on the condition result
+- Only the selected branch is traversed
+- Condition output stored in the execution context
+- Frontend condition-node configuration and visible branch handles
+- Branch metadata preserved during save/load
+- Frontend connection guards aligned with backend graph rules
+- Numeric input handling for numeric comparison operators
+- `EXISTS` uses only the left operand
+- Full backend verification: **173 tests, 0 failures, 0 errors, 0 skipped**
+- Frontend production build and lint verification: both green
+- Manual end-to-end verification of both TRUE and FALSE paths
+
+### Condition model
+
+V0.11 intentionally uses a small explicit configuration:
+
+```json
+{
+  "operator": "EQUALS",
+  "left": "hello",
+  "right": "hello"
+}
+```
+
+`EXISTS` uses `left` only.
+
+General variables and expressions remain a V0.12 concern.
+
+### Branching model
+
+```text
+                  +---- TRUE ----> downstream path A
+                  |
+Condition --------+
+                  |
+                  +---- FALSE ---> downstream path B
+```
+
+A condition node must have exactly one `TRUE` and one `FALSE` outgoing edge. Ordinary nodes remain linear and may have at most one outgoing edge.
+
+### V0.11 boundary
+
+V0.11 does not add:
+
+- variables or general expressions;
+- arbitrary expression evaluation or code execution;
+- loops;
+- durable delays;
+- webhooks;
+- parallel branch execution;
+- a second workflow execution engine.
+
 ## Frontend V0.9 Checkpoint
 
 The frontend catch-up completed alongside the V0.9 backend checkpoint. This work connects the existing React application to the persisted asynchronous execution APIs without introducing new backend capabilities.
@@ -1839,6 +1912,9 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/architecture/v0.8-architecture.md`](docs/architecture/v0.8-architecture.md)
 - [`docs/architecture/v0.9-architecture.md`](docs/architecture/v0.9-architecture.md)
 - [`docs/architecture/v0.10-architecture.md`](docs/architecture/v0.10-architecture.md)
+- [`docs/architecture/v0.11-architecture.md`](docs/architecture/v0.11-architecture.md)
+
+- [`docs/v0.11-release-verification.md`](docs/v0.11-release-verification.md)
 
 ### Frontend
 
