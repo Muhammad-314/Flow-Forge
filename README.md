@@ -6,9 +6,9 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.12 — Variables + Expressions**
+**V0.13 — Loops**
 
-V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.9 established the idempotent execution-claim boundary. V0.10 adds durable workflow scheduling and hands scheduled executions into the existing asynchronous execution pipeline. V0.11 adds controlled conditional branching. V0.12 adds stable node keys, runtime references, and a deliberately constrained expression language.
+V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.9 established the idempotent execution-claim boundary. V0.10 adds durable workflow scheduling and hands scheduled executions into the existing asynchronous execution pipeline. V0.11 adds controlled conditional branching. V0.12 adds stable node keys, runtime references, and a deliberately constrained expression language. V0.13 adds explicit loop execution semantics for iterating over runtime collections while preserving the existing execution, reliability, scheduling, idempotency, and expression pipeline.
 
 ## V0.1 — Foundation
 
@@ -1431,6 +1431,115 @@ Loops remain V0.13 work.
 
 See [`docs/architecture/v0.12-architecture.md`](docs/architecture/v0.12-architecture.md), [`docs/decisions/ADR-014-runtime-references-and-constrained-expressions.md`](docs/decisions/ADR-014-runtime-references-and-constrained-expressions.md), and [`docs/v0.12-release-verification.md`](docs/v0.12-release-verification.md).
 
+## V0.13 — Loops
+
+### Goal
+
+V0.13 answers:
+
+> Can FlowForge iterate over runtime data without treating a controlled workflow loop as an invalid ordinary graph cycle?
+
+The answer is yes.
+
+V0.13 moves the execution engine beyond simple DAG traversal toward explicit workflow-runtime semantics while preserving the V0.12 runtime-data model.
+
+### Implemented and verified
+
+- `loop` workflow node
+- Loop `items` configuration resolved through the existing runtime-reference/expression path
+- Explicit `BODY` and `DONE` edge branches
+- Validation requiring exactly one `BODY` and one `DONE` outgoing edge from a loop node
+- Controlled loop traversal from the body back to the loop
+- Per-iteration `variables.loopItem`
+- Per-iteration `variables.loopIndex`
+- Multiple collection-item iterations
+- Empty collections skip the loop body and continue through `DONE`
+- Loop completion continues through the `DONE` branch
+- Ordinary non-loop cycles remain invalid
+- Frontend loop-node configuration and visible `BODY` / `DONE` handles
+- Loop branch metadata preserved during save/load
+- Full backend verification: **208 tests, 0 failures, 0 errors, 0 skipped**
+- Frontend production build and lint verification: both green
+- Manual browser verification of loop creation, configuration, persistence, iteration, completion, and empty-collection behavior
+
+### Loop model
+
+A loop is represented as an explicit control-flow construct:
+
+```text
+Get Customers
+      |
+      v
+    LOOP
+   /    \
+ BODY   DONE
+  |       |
+  v       v
+Send    Continue
+Email   workflow
+  |
+  +------> LOOP
+```
+
+The loop's `items` configuration identifies the collection to iterate over. For each item, FlowForge exposes:
+
+```text
+variables.loopItem
+variables.loopIndex
+```
+
+The body executes once for each item. When the collection is exhausted, traversal follows `DONE`.
+
+### Example configuration
+
+```json
+{
+  "items": "{{nodes.get_customers.output.customers}}"
+}
+```
+
+The loop uses the existing V0.12 runtime-data model rather than introducing a second expression or variable system.
+
+### Execution boundary
+
+V0.13 changes workflow traversal semantics only where an explicit `loop` node is present.
+
+The existing execution pipeline remains intact:
+
+```text
+API / Scheduler
+      ↓
+Persisted Execution
+      ↓
+RabbitMQ
+      ↓
+ExecutionWorkerService
+      ↓
+WorkflowExecutionEngine
+      ↓
+WorkflowNodeExecutorRegistry
+```
+
+Loop state is execution-local. V0.13 does not introduce durable waiting, workflow suspension, a second execution engine, or a second source of truth.
+
+### Important V0.13 boundary
+
+V0.13 deliberately does not add:
+
+- durable delays or waiting;
+- webhooks;
+- parallel branch execution;
+- WebSockets or real-time execution UI;
+- microservices;
+- a second workflow execution engine;
+- a second message broker;
+- a second source of truth;
+- changes to the existing retry/DLQ or idempotency architecture beyond what is required for loop correctness.
+
+Loops are an execution-time control-flow construct. Durable suspension belongs to V0.14.
+
+See [`docs/architecture/v0.13-architecture.md`](docs/architecture/v0.13-architecture.md), [`docs/decisions/ADR-015-loop-execution-semantics.md`](docs/decisions/ADR-015-loop-execution-semantics.md), [`docs/diagrams/loops-v0.13.md`](docs/diagrams/loops-v0.13.md), and [`docs/v0.13-release-verification.md`](docs/v0.13-release-verification.md).
+
 ## Frontend V0.9 Checkpoint
 
 The frontend catch-up completed alongside the V0.9 backend checkpoint. This work connects the existing React application to the persisted asynchronous execution APIs without introducing new backend capabilities.
@@ -1670,7 +1779,7 @@ http://localhost:5173
 
 ### Backend
 
-The current V0.10 backend verification completed successfully with:
+The V0.13 backend verification completed successfully with:
 
 ```powershell
 .\mvnw.cmd test
@@ -1679,7 +1788,7 @@ The current V0.10 backend verification completed successfully with:
 The full backend suite passed with:
 
 ```text
-Tests run: 158
+Tests run: 208
 Failures: 0
 Errors: 0
 Skipped: 0
@@ -1702,6 +1811,9 @@ V0.7 additionally verifies:
 - duplicate delivery during a retry attempt
 - concurrent PostgreSQL execution-claim races
 - idempotent execution-claim persistence
+- loop iteration and controlled cycle execution
+- loop item/index runtime-variable isolation across iterations
+- empty-collection loop completion through `DONE`
 
 Historical version-specific verification details remain documented below.
 
@@ -2092,9 +2204,11 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/architecture/v0.10-architecture.md`](docs/architecture/v0.10-architecture.md)
 - [`docs/architecture/v0.11-architecture.md`](docs/architecture/v0.11-architecture.md)
 - [`docs/architecture/v0.12-architecture.md`](docs/architecture/v0.12-architecture.md)
+- [`docs/architecture/v0.13-architecture.md`](docs/architecture/v0.13-architecture.md)
 
 - [`docs/v0.11-release-verification.md`](docs/v0.11-release-verification.md)
 - [`docs/v0.12-release-verification.md`](docs/v0.12-release-verification.md)
+- [`docs/v0.13-release-verification.md`](docs/v0.13-release-verification.md)
 
 ### Frontend
 
@@ -2124,6 +2238,7 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/decisions/ADR-012-execution-idempotency.md`](docs/decisions/ADR-012-execution-idempotency.md)
 - [`docs/decisions/ADR-013-durable-workflow-scheduling.md`](docs/decisions/ADR-013-durable-workflow-scheduling.md)
 - [`docs/decisions/ADR-014-runtime-references-and-constrained-expressions.md`](docs/decisions/ADR-014-runtime-references-and-constrained-expressions.md)
+- [`docs/decisions/ADR-015-loop-execution-semantics.md`](docs/decisions/ADR-015-loop-execution-semantics.md)
 - [`docs/frontend-v0.10.md`](docs/frontend-v0.10.md)
 
 ### Diagrams
@@ -2137,6 +2252,7 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/diagrams/reliability-v0.8.md`](docs/diagrams/reliability-v0.8.md)
 - [`docs/diagrams/idempotency-v0.9.md`](docs/diagrams/idempotency-v0.9.md)
 - [`docs/diagrams/scheduling-v0.10.md`](docs/diagrams/scheduling-v0.10.md)
+- [`docs/diagrams/loops-v0.13.md`](docs/diagrams/loops-v0.13.md)
 
 ## Architecture Evolution
 
@@ -2163,9 +2279,9 @@ V0.10 Scheduling
   ↓
 V0.11 Conditions + Branching
   ↓
-V0.12 Variables + Expressions   ← current
+V0.12 Variables + Expressions
   ↓
-V0.13 Loops
+V0.13 Loops                    ← current
   ↓
 ...
 V1.0 Production-Grade FlowForge
@@ -2175,6 +2291,6 @@ The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worke
 
 ## Next Version
 
-**V0.13 — Loops**
+**V0.14 — Durable Waiting**
 
-V0.12 is the current completed variables-and-expressions checkpoint. The next planned version introduces loop execution semantics.
+V0.13 is the current completed loop-execution checkpoint. The next planned version introduces durable workflow waiting/suspension semantics.
