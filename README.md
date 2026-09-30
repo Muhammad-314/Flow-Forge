@@ -6,9 +6,9 @@ The project is intentionally developed version by version. Each version solves a
 
 ## Current Version
 
-**V0.11 — Conditions + Branching**
+**V0.12 — Variables + Expressions**
 
-V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.9 established the idempotent execution-claim boundary. V0.10 adds durable workflow scheduling and hands scheduled executions into the existing asynchronous execution pipeline.
+V0.1 established the backend foundation and basic product surface. V0.2 adds the first persistent visual workflow-definition system. V0.9 established the idempotent execution-claim boundary. V0.10 adds durable workflow scheduling and hands scheduled executions into the existing asynchronous execution pipeline. V0.11 adds controlled conditional branching. V0.12 adds stable node keys, runtime references, and a deliberately constrained expression language.
 
 ## V0.1 — Foundation
 
@@ -1253,6 +1253,184 @@ V0.11 does not add:
 - parallel branch execution;
 - a second workflow execution engine.
 
+## V0.12 — Variables + Expressions
+
+### Goal
+
+V0.12 answers:
+
+> Can workflow nodes reference trigger data, variables, and previous node outputs at runtime, while supporting useful boolean expressions without introducing arbitrary code execution?
+
+The answer is yes.
+
+### Implemented and verified
+
+- Runtime reference syntax for trigger data:
+  - `{{trigger.customer.email}}`
+- Runtime reference syntax for workflow variables:
+  - `{{variables.customerId}}`
+- Runtime reference syntax for previous node outputs:
+  - `{{nodes.http_1.output.customer_id}}`
+- Stable human-readable node keys such as:
+  - `http_1`
+  - `transform_1`
+  - `condition_1`
+- Stable node keys persisted alongside the existing UUID node identity
+- Node-key validation and duplicate-key detection within a workflow version
+- Database migration for persisted node keys
+- `RuntimeReferenceResolver` for runtime path resolution
+- `ConstrainedExpressionEvaluator` for boolean expressions such as:
+  - `${trigger.amount > 100}`
+- Condition expressions can use runtime references
+- Structured condition operands can use runtime references
+- Runtime references to node outputs are resolved through the execution engine's node-key index
+- Missing or invalid runtime references fail explicitly rather than silently resolving to `null`
+- Arbitrary JavaScript or unrestricted expression execution is not introduced
+- Workflow editor displays stable node keys and preserves them during save/load
+- Full backend verification: **203 tests, 0 failures, 0 errors, 0 skipped**
+- Frontend production build and lint verification: both green
+
+### Runtime reference model
+
+```text
+{{trigger.customer.email}}
+        |
+        v
+ExecutionContext.triggerData
+
+{{variables.customerId}}
+        |
+        v
+ExecutionContext.variables
+
+{{nodes.http_1.output.customer_id}}
+        |
+        v
+node key -> UUID -> ExecutionContext.nodeOutputs
+```
+
+The UUID remains the internal node identity. The stable node key is the persisted, human-readable reference used by workflow expressions.
+
+### Constrained expression model
+
+V0.12 supports a deliberately limited expression language.
+
+Example:
+
+```text
+${trigger.amount > 100}
+```
+
+A condition may use either the existing structured form:
+
+```json
+{
+  "operator": "GREATER_THAN",
+  "left": "{{trigger.amount}}",
+  "right": 100
+}
+```
+
+or the expression form:
+
+```json
+{
+  "expression": "${trigger.amount > 100}"
+}
+```
+
+A condition cannot specify both forms at the same time.
+
+The expression evaluator resolves supported runtime references and evaluates only the supported expression constructs. It does not execute arbitrary JavaScript.
+
+### Stable node-key model
+
+Workflow nodes retain their UUID as the internal database identity:
+
+```text
+WorkflowNode
+├── id   UUID
+├── key  http_1
+├── type httpRequest
+└── config
+```
+
+The key is unique within a workflow version.
+
+For example:
+
+```text
+http_1 -> 7f... UUID
+http_2 -> a3... UUID
+```
+
+A runtime reference:
+
+```text
+{{nodes.http_1.output.customer_id}}
+```
+
+is resolved by:
+
+1. finding `http_1` in the workflow's node-key index;
+2. obtaining its UUID;
+3. reading that node's output from `ExecutionContext`;
+4. resolving the requested output path.
+
+### Execution boundary
+
+The execution engine constructs a node-key index once for the current workflow definition and passes it through `NodeExecutionContext`.
+
+```text
+WorkflowDefinition
+      |
+      | nodes: key + UUID
+      v
+WorkflowExecutionEngine
+      |
+      | nodeKeys
+      v
+NodeExecutionContext
+      |
+      v
+ConditionExecutor
+      |
+      v
+RuntimeReferenceResolver
+      |
+      v
+ExecutionContext
+```
+
+This keeps definition identity, runtime state, and expression resolution separated.
+
+### Frontend boundary
+
+The workflow editor:
+
+- generates stable keys for newly created nodes;
+- persists keys with workflow definitions;
+- loads keys from the backend;
+- displays the key in the selected-node configuration;
+- treats the key as read-only to avoid silently breaking existing runtime references.
+
+### Important V0.12 boundary
+
+V0.12 deliberately does not introduce:
+
+- arbitrary JavaScript execution;
+- an unrestricted expression language;
+- loops;
+- durable delays;
+- webhooks;
+- parallel branch execution;
+- a second workflow execution engine;
+- a second source of truth for execution state.
+
+Loops remain V0.13 work.
+
+See [`docs/architecture/v0.12-architecture.md`](docs/architecture/v0.12-architecture.md), [`docs/decisions/ADR-014-runtime-references-and-constrained-expressions.md`](docs/decisions/ADR-014-runtime-references-and-constrained-expressions.md), and [`docs/v0.12-release-verification.md`](docs/v0.12-release-verification.md).
+
 ## Frontend V0.9 Checkpoint
 
 The frontend catch-up completed alongside the V0.9 backend checkpoint. This work connects the existing React application to the persisted asynchronous execution APIs without introducing new backend capabilities.
@@ -1913,8 +2091,10 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/architecture/v0.9-architecture.md`](docs/architecture/v0.9-architecture.md)
 - [`docs/architecture/v0.10-architecture.md`](docs/architecture/v0.10-architecture.md)
 - [`docs/architecture/v0.11-architecture.md`](docs/architecture/v0.11-architecture.md)
+- [`docs/architecture/v0.12-architecture.md`](docs/architecture/v0.12-architecture.md)
 
 - [`docs/v0.11-release-verification.md`](docs/v0.11-release-verification.md)
+- [`docs/v0.12-release-verification.md`](docs/v0.12-release-verification.md)
 
 ### Frontend
 
@@ -1943,6 +2123,7 @@ V0.8 also does not introduce a transactional outbox or durable scheduler. A futu
 - [`docs/decisions/ADR-011-execution-reliability.md`](docs/decisions/ADR-011-execution-reliability.md)
 - [`docs/decisions/ADR-012-execution-idempotency.md`](docs/decisions/ADR-012-execution-idempotency.md)
 - [`docs/decisions/ADR-013-durable-workflow-scheduling.md`](docs/decisions/ADR-013-durable-workflow-scheduling.md)
+- [`docs/decisions/ADR-014-runtime-references-and-constrained-expressions.md`](docs/decisions/ADR-014-runtime-references-and-constrained-expressions.md)
 - [`docs/frontend-v0.10.md`](docs/frontend-v0.10.md)
 
 ### Diagrams
@@ -1978,7 +2159,13 @@ V0.8  Reliability
   ↓
 V0.9  Idempotency
   ↓
-V0.10 Scheduling   ← current
+V0.10 Scheduling
+  ↓
+V0.11 Conditions + Branching
+  ↓
+V0.12 Variables + Expressions   ← current
+  ↓
+V0.13 Loops
   ↓
 ...
 V1.0 Production-Grade FlowForge
@@ -1988,6 +2175,6 @@ The project deliberately avoids premature infrastructure. RabbitMQ, Redis, worke
 
 ## Next Version
 
-**V0.11 — TBD**
+**V0.13 — Loops**
 
-V0.10 is the current completed scheduling checkpoint. The next version will be defined after the V0.10 checkpoint is committed and pushed.
+V0.12 is the current completed variables-and-expressions checkpoint. The next planned version introduces loop execution semantics.
